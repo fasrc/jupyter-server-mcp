@@ -347,7 +347,9 @@ class MCPExtensionApp(ExtensionApp):
                     timeout=self.mcp_shutdown_timeout,
                 )
                 return
-            except TimeoutError:
+            # In python 3.10 asyncio.wait_for raised asyncio.TimeoutError;
+            # In python 3.11 asyncio.TimeoutError is a deprecated alias of TimeoutError
+            except asyncio.TimeoutError:
                 self.log.warning("Timed out waiting for MCP server to stop")
 
         self.mcp_server_task.cancel()
