@@ -68,7 +68,7 @@ class TestResolveEndpoint:
         assert endpoint == ("http://env:1234/mcp", None)
 
     def test_single_server_discovery(self, isolated_runtime_dir):
-        """A single running server is selected automatically."""
+        """A single running server is selected when it serves ``cwd``."""
         _publish_server(isolated_runtime_dir, 101, root_dir=isolated_runtime_dir)
 
         endpoint = proxy.resolve_endpoint(
@@ -105,6 +105,20 @@ class TestResolveEndpoint:
 
         assert endpoint == (proxy.UDS_URL, "/run/mcp.sock")
 
+    def test_single_server_outside_cwd_raises(self, isolated_runtime_dir, tmp_path):
+        """A single running server is refused when ``cwd`` is not under its root."""
+        root = tmp_path / "project"
+        other = tmp_path / "other"
+        root.mkdir()
+        other.mkdir()
+        _publish_server(isolated_runtime_dir, 101, root_dir=root)
+
+        with pytest.raises(proxy.ProxyError, match="No running Jupyter MCP server"):
+            proxy.resolve_endpoint(
+                runtime_dir=str(isolated_runtime_dir),
+                cwd=str(other),
+            )
+
     def test_no_servers_raises(self, isolated_runtime_dir):
         """An empty runtime directory produces a helpful error."""
         with pytest.raises(proxy.ProxyError, match="No running Jupyter MCP servers"):
@@ -118,7 +132,12 @@ class TestResolveEndpoint:
         path = runtime.info_file_path(isolated_runtime_dir, 17)
         runtime.write_info_file(
             path,
-            {"pid": 17, "host": "localhost", "port": 3001, "root_dir": "/tmp"},
+            {
+                "pid": 17,
+                "host": "localhost",
+                "port": 3001,
+                "root_dir": str(isolated_runtime_dir),
+            },
         )
 
         with pytest.raises(proxy.ProxyError, match="has no URL"):
@@ -194,7 +213,7 @@ class TestSelectServer:
 
         assert chosen["pid"] == 2
 
-    def test_falls_back_when_no_match_is_ambiguous(self, tmp_path):
+    def test_multiple_servers_none_containing_cwd_raises(self, tmp_path):
         """If no server contains the cwd, the user must disambiguate."""
         other_a = tmp_path / "a"
         other_b = tmp_path / "b"
@@ -208,7 +227,7 @@ class TestSelectServer:
             {"pid": 2, "url": "http://localhost:3002/mcp", "root_dir": str(other_b)},
         ]
 
-        with pytest.raises(proxy.ProxyError, match="Multiple Jupyter MCP servers"):
+        with pytest.raises(proxy.ProxyError, match="No running Jupyter MCP server"):
             proxy.select_server(servers, cwd.resolve())
 
     def test_ambiguous_same_root_dir(self, tmp_path):
@@ -224,16 +243,36 @@ class TestSelectServer:
         with pytest.raises(proxy.ProxyError, match="Multiple Jupyter MCP servers"):
             proxy.select_server(servers, root.resolve())
 
-    def test_single_server_returned_regardless_of_cwd(self, tmp_path):
-        """With only one candidate, return it even if cwd is unrelated."""
-        unrelated = tmp_path / "unrelated"
-        unrelated.mkdir()
+    @pytest.mark.parametrize("relative_cwd", ["", "src/pkg"])
+    def test_single_server_containing_cwd_is_selected(self, tmp_path, relative_cwd):
+        """A lone server is selected when cwd equals or sits below its root_dir."""
+        root = tmp_path / "project"
+        cwd = root / relative_cwd
+        cwd.mkdir(parents=True)
 
         servers = [
-            {"pid": 1, "url": "http://localhost:3001/mcp", "root_dir": str(tmp_path)},
+            {"pid": 1, "url": "http://localhost:3001/mcp", "root_dir": str(root)},
         ]
 
-        assert proxy.select_server(servers, unrelated.resolve())["pid"] == 1
+        assert proxy.select_server(servers, cwd.resolve())["pid"] == 1
+
+    def test_single_server_outside_cwd_raises(self, tmp_path):
+        """A lone server is refused when cwd is not under its root_dir."""
+        root = tmp_path / "project"
+        unrelated = tmp_path / "unrelated"
+        root.mkdir()
+        unrelated.mkdir()
+
+        server = {"pid": 1, "url": "http://localhost:3001/mcp", "root_dir": str(root)}
+
+        with pytest.raises(proxy.ProxyError) as excinfo:
+            proxy.select_server([server], unrelated.resolve())
+
+        message = str(excinfo.value)
+        assert message.startswith(f"No running Jupyter MCP server serves {unrelated}")
+        assert proxy._describe(server) in message
+        assert "--url" in message
+        assert proxy.ENV_URL in message
 
 
 class TestMainCLI:
@@ -244,11 +283,28 @@ class TestMainCLI:
     ):
         """Discovery failures produce an error message and non-zero exit."""
         monkeypatch.chdir(isolated_runtime_dir)
-        exit_code = proxy.main([])
+        exit_code = proxy.main(["--runtime-dir", str(isolated_runtime_dir)])
 
         assert exit_code == 2
         captured = capsys.readouterr()
         assert "No running Jupyter MCP servers" in captured.err
+
+    def test_main_refuses_single_server_outside_cwd(
+        self, isolated_runtime_dir, capsys, tmp_path
+    ):
+        """A lone server that does not serve ``--cwd`` is an error, not a proxy."""
+        root = tmp_path / "project"
+        other = tmp_path / "other"
+        root.mkdir()
+        other.mkdir()
+        _publish_server(isolated_runtime_dir, 101, root_dir=root)
+
+        exit_code = proxy.main(
+            ["--runtime-dir", str(isolated_runtime_dir), "--cwd", str(other)]
+        )
+
+        assert exit_code == 2
+        assert f"root_dir={str(root)!r}" in capsys.readouterr().err
 
     def test_main_connects_with_explicit_url(self, monkeypatch):
         """An explicit URL should trigger ``run_proxy`` without discovery."""

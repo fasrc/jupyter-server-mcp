@@ -2,9 +2,9 @@
 
 The extension writes a runtime info file when it starts (see
 ``jupyter_server_mcp.runtime``). This module reads those files, picks the
-server that best matches the current working directory, and forwards MCP
-traffic from stdio to the server's HTTP endpoint, over TCP or over the
-server's Unix domain socket.
+server whose root directory contains the current working directory, and
+forwards MCP traffic from stdio to the server's HTTP endpoint, over TCP or
+over the server's Unix domain socket.
 
 Run it with ``python -m jupyter_server_mcp.proxy``. MCP clients only need
 this stable command, regardless of which port the server is actually using.
@@ -77,8 +77,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--cwd",
         default=None,
         help=(
-            "Directory used when disambiguating between multiple running "
-            "servers. Defaults to the current working directory."
+            "Directory matched against the root directory of each running "
+            "server. Defaults to the current working directory."
         ),
     )
     return parser.parse_args(argv)
@@ -119,17 +119,12 @@ def _describe(server: dict[str, Any]) -> str:
 
 
 def select_server(servers: list[dict[str, Any]], cwd: Path) -> dict[str, Any]:
-    """Pick the MCP server that best matches ``cwd``.
+    """Pick the server whose ``root_dir`` is the most specific ancestor of ``cwd``.
 
-    Selection rules:
-      * Zero servers → :class:`ProxyError`.
-      * Exactly one server → return it unconditionally, even if ``cwd`` is
-        not below its ``root_dir`` (assumes the user just wants to connect).
-      * Multiple servers → score each candidate by how deep its ``root_dir``
-        sits above ``cwd`` and pick the most specific. Ambiguous or missing
-        matches raise :class:`ProxyError` with a listing, so the user can
-        disambiguate via ``--url``, ``--uds``, or the ``JUPYTER_SERVER_MCP_URL``
-        env var.
+    A lone server is held to the same rule, so an agent session started in an
+    unrelated folder never reaches a server that serves another project. No
+    server, no containing server, or a tie for the deepest match raises
+    :class:`ProxyError` with the candidates listed.
     """
     if not servers:
         msg = (
@@ -138,9 +133,6 @@ def select_server(servers: list[dict[str, Any]], cwd: Path) -> dict[str, Any]:
             f"--uds / set ${ENV_URL}."
         )
         raise ProxyError(msg)
-
-    if len(servers) == 1:
-        return servers[0]
 
     scored = [
         (score, server)
@@ -156,17 +148,18 @@ def select_server(servers: list[dict[str, Any]], cwd: Path) -> dict[str, Any]:
         if len(top_matches) == 1:
             return top_matches[0]
         candidates = top_matches
+        reason = f"Multiple Jupyter MCP servers match {cwd}"
+        hint = f"Pick one explicitly with --url, --uds, or ${ENV_URL}"
     else:
         candidates = servers
+        reason = f"No running Jupyter MCP server serves {cwd}"
+        hint = (
+            "Start the agent inside the folder a server serves, start a "
+            f"Jupyter server in this folder, or pass --url / --uds / set ${ENV_URL}"
+        )
 
     listing = "\n".join(f"  - {_describe(server)}" for server in candidates)
-    reason = (
-        "Multiple Jupyter MCP servers match the current working directory"
-        if scored
-        else "Multiple Jupyter MCP servers are running and none contains the "
-        "current working directory"
-    )
-    msg = f"{reason}. Pick one explicitly with --url, --uds, or ${ENV_URL}:\n{listing}"
+    msg = f"{reason}. {hint}:\n{listing}"
     raise ProxyError(msg)
 
 
